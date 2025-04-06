@@ -335,6 +335,7 @@ pub mod error {
 
 use self::error::{RecvError, SendError, TryRecvError};
 
+use super::casn::CASNDescriptor;
 use super::Notify;
 
 /// Data shared between senders and receivers.

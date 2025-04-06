@@ -29,8 +29,10 @@ impl RDCSSDescriptor {
     }
 
     unsafe fn cas(d: *const RDCSSDescriptor) -> usize {
+        let mut r: usize;
+
         loop {
-            let r = (*(*d).a2)
+            r = (*(*d).a2)
                 .compare_exchange_weak(
                     (*d).o2,
                     (d as usize) | RDCSS_DESCRIPTOR_MASK,
@@ -41,30 +43,26 @@ impl RDCSSDescriptor {
             if Self::is_desciptor(r) {
                 Self::complete((r & PTR_MASK) as *const RDCSSDescriptor);
             } else {
-                return r;
+                break;
             }
         }
+
+        if r == (*d).o2 {
+            Self::complete(d);
+        }
+
+        return r;
     }
 
     unsafe fn complete(d: *const RDCSSDescriptor) {
         let v = (*(*d).a1).load(Ordering::SeqCst);
-        if v == (*d).o1 {
-            #[allow(unused)]
-            (*(*d).a2).compare_exchange_weak(
-                (d as usize) | RDCSS_DESCRIPTOR_MASK,
-                (*d).n2,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            );
-        } else {
-            #[allow(unused)]
-            (*(*d).a2).compare_exchange_weak(
-                (d as usize) | RDCSS_DESCRIPTOR_MASK,
-                (*d).o2,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            );
-        }
+        #[allow(unused)]
+        (*(*d).a2).compare_exchange_weak(
+            (d as usize) | RDCSS_DESCRIPTOR_MASK,
+            if v == (*d).o1 { (*d).n2 } else { (*d).o2 },
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
     }
 }
 
@@ -75,15 +73,19 @@ enum Status {
     Failed,
 }
 
-struct CASNDescriptor {
-    addrs: Vec<*const AtomicUsize>,
-    expected: Vec<usize>,
-    new: Vec<usize>,
+pub(crate) struct CASNDescriptor<'a> {
+    addrs: &'a [&'a AtomicUsize],
+    expected: &'a [usize],
+    new: &'a [usize],
     status: AtomicUsize,
 }
 
-impl CASNDescriptor {
-    fn new(addrs: Vec<*const AtomicUsize>, expected: Vec<usize>, new: Vec<usize>) -> Self {
+impl<'a> CASNDescriptor<'a> {
+    pub(crate) fn new(
+        addrs: &'a [&'a AtomicUsize],
+        expected: &'a [usize],
+        new: &'a [usize],
+    ) -> Self {
         assert_eq!(addrs.len(), expected.len());
         assert_eq!(addrs.len(), new.len());
 
@@ -99,33 +101,41 @@ impl CASNDescriptor {
         value & CASN_DESCRIPTOR_MASK == CASN_DESCRIPTOR_MASK
     }
 
-    unsafe fn cas(cd: *const CASNDescriptor) -> bool {
-        if (*cd).status.load(Ordering::SeqCst) == Status::Undecided as usize {
+    fn as_usize(&self) -> usize {
+        self as *const CASNDescriptor<'_> as usize
+    }
+
+    pub(crate) unsafe fn cas(&self) -> bool {
+        if self.status.load(Ordering::SeqCst) == Status::Undecided as usize {
             let mut status = Status::Succeeded;
-            for i in (0..(*cd).addrs.len()).take_while(|_| status == Status::Succeeded) {
+            for i in 0..self.addrs.len() {
+                if status != Status::Succeeded {
+                    break;
+                }
                 loop {
                     let rdcss = RDCSSDescriptor::new(
-                        &(*cd).status as *const AtomicUsize,
+                        &self.status as *const AtomicUsize,
                         Status::Undecided as usize,
-                        (*cd).addrs[i],
-                        (*cd).expected[i],
-                        (cd as usize) | CASN_DESCRIPTOR_MASK,
+                        self.addrs[i],
+                        self.expected[i],
+                        self.as_usize() | CASN_DESCRIPTOR_MASK,
                     );
 
                     let val = RDCSSDescriptor::cas(&rdcss as *const RDCSSDescriptor);
                     if Self::is_descriptor(val) {
-                        if val & PTR_MASK != (cd as usize) {
-                            Self::cas(val as *const CASNDescriptor);
+                        if val & PTR_MASK != self.as_usize() {
+                            Self::cas((val as *const CASNDescriptor<'_>).as_ref().unwrap());
                             continue;
-                        } else if val != (*cd).expected[i] {
-                            status = Status::Failed;
                         }
+                    } else if val != self.expected[i] {
+                        status = Status::Failed;
                     }
+                    break;
                 }
             }
 
             #[allow(unused)]
-            (*cd).status.compare_exchange_weak(
+            self.status.compare_exchange_weak(
                 Status::Undecided as usize,
                 status as usize,
                 Ordering::SeqCst,
@@ -133,20 +143,41 @@ impl CASNDescriptor {
             );
         }
 
-        let succeeded = (*cd).status.load(Ordering::SeqCst) == (Status::Succeeded as usize);
-        for i in 0..(*cd).addrs.len() {
+        let succeeded = self.status.load(Ordering::SeqCst) == (Status::Succeeded as usize);
+        for i in 0..self.addrs.len() {
             #[allow(unused)]
-            (*(*cd).addrs[i]).compare_exchange_weak(
-                (cd as usize) | CASN_DESCRIPTOR_MASK,
+            (*self.addrs[i]).compare_exchange_weak(
+                self.as_usize() | CASN_DESCRIPTOR_MASK,
                 if succeeded {
-                    (*cd).new[i]
+                    self.new[i]
                 } else {
-                    (*cd).expected[i]
+                    self.expected[i]
                 },
                 Ordering::SeqCst,
                 Ordering::SeqCst,
             );
         }
         succeeded
+    }
+}
+
+#[cfg(not(loom))]
+#[cfg(test)]
+mod tests {
+
+    use super::*;
+
+    #[test]
+    fn just_work() {
+        let a = AtomicUsize::new(69);
+        let b = AtomicUsize::new(1488);
+        let memory = &[&a, &b];
+
+        let casn = CASNDescriptor::new(memory, &[69, 1488], &[1488, 69]);
+        unsafe {
+            casn.cas();
+        }
+        assert_eq!(a.load(Ordering::SeqCst), 1488);
+        assert_eq!(b.load(Ordering::SeqCst), 69);
     }
 }
