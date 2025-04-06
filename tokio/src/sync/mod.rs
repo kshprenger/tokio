@@ -455,6 +455,8 @@ cfg_sync! {
     mod barrier;
     pub use barrier::{Barrier, BarrierWaitResult};
 
+    mod casn;
+
     pub mod broadcast;
 
     pub mod mpsc;
