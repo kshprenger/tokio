@@ -28,38 +28,50 @@ impl RDCSSDescriptor {
         value & RDCSS_DESCRIPTOR_MASK == RDCSS_DESCRIPTOR_MASK
     }
 
-    unsafe fn cas(d: *const RDCSSDescriptor) -> usize {
+    fn to_ptr(value: usize) -> *const RDCSSDescriptor {
+        (value & PTR_MASK) as *const RDCSSDescriptor
+    }
+
+    fn to_usize(ptr: *const RDCSSDescriptor) -> usize {
+        (ptr as usize) | RDCSS_DESCRIPTOR_MASK
+    }
+
+    unsafe fn cas(d_ptr: *const RDCSSDescriptor) -> usize {
         let mut r: usize;
 
+        let d_ref = d_ptr.as_ref().unwrap();
+
         loop {
-            r = (*(*d).a2)
+            r = (*d_ref.a2)
                 .compare_exchange_weak(
-                    (*d).o2,
-                    (d as usize) | RDCSS_DESCRIPTOR_MASK,
+                    d_ref.o2,
+                    Self::to_usize(d_ptr),
                     Ordering::SeqCst,
                     Ordering::SeqCst,
                 )
                 .unwrap_or_else(|prev| prev);
             if Self::is_desciptor(r) {
-                Self::complete((r & PTR_MASK) as *const RDCSSDescriptor);
+                Self::complete(Self::to_ptr(r));
             } else {
                 break;
             }
         }
 
-        if r == (*d).o2 {
-            Self::complete(d);
+        if r == d_ref.o2 {
+            Self::complete(d_ptr);
         }
 
         return r;
     }
 
-    unsafe fn complete(d: *const RDCSSDescriptor) {
-        let v = (*(*d).a1).load(Ordering::SeqCst);
+    unsafe fn complete(d_ptr: *const RDCSSDescriptor) {
+        let d_ref = d_ptr.as_ref().unwrap();
+        let v = (*d_ref.a1).load(Ordering::SeqCst);
+
         #[allow(unused)]
-        (*(*d).a2).compare_exchange_weak(
-            (d as usize) | RDCSS_DESCRIPTOR_MASK,
-            if v == (*d).o1 { (*d).n2 } else { (*d).o2 },
+        (*d_ref.a2).compare_exchange_weak(
+            Self::to_usize(d_ptr),
+            if v == d_ref.o1 { d_ref.n2 } else { d_ref.o2 },
             Ordering::SeqCst,
             Ordering::SeqCst,
         );
@@ -70,8 +82,9 @@ impl RDCSSDescriptor {
         loop {
             r = addr.load(Ordering::SeqCst);
             if Self::is_desciptor(r) {
+                // SAFETY: r is discriptor pointer stored previously
                 unsafe {
-                    Self::complete((r & PTR_MASK) as *const RDCSSDescriptor);
+                    Self::complete(Self::to_ptr(r));
                 }
             } else {
                 return r;
@@ -108,7 +121,15 @@ impl<'a> CASNDescriptor<'a> {
         value & CASN_DESCRIPTOR_MASK == CASN_DESCRIPTOR_MASK
     }
 
-    unsafe fn cas(cd_ptr: *const CASNDescriptor) -> bool {
+    fn to_usize(ptr: *const CASNDescriptor<'_>) -> usize {
+        (ptr as usize) | CASN_DESCRIPTOR_MASK
+    }
+
+    fn to_ptr(value: usize) -> *const CASNDescriptor<'a> {
+        (value & PTR_MASK) as *const CASNDescriptor<'a>
+    }
+
+    unsafe fn cas(cd_ptr: *const CASNDescriptor<'_>) -> bool {
         let cd = cd_ptr.as_ref().unwrap();
         if cd.status.load(Ordering::SeqCst) == Status::Undecided as usize {
             let mut status = Status::Succeeded;
@@ -122,13 +143,13 @@ impl<'a> CASNDescriptor<'a> {
                         Status::Undecided as usize,
                         cd.addrs[i],
                         cd.expected[i],
-                        (cd_ptr as usize) | CASN_DESCRIPTOR_MASK,
+                        Self::to_usize(cd_ptr),
                     );
 
                     let val = RDCSSDescriptor::cas(&rdcss as *const RDCSSDescriptor);
                     if Self::is_descriptor(val) {
                         if val & PTR_MASK != (cd_ptr as usize) {
-                            Self::cas((val as *const CASNDescriptor<'_>).as_ref().unwrap());
+                            Self::cas(Self::to_ptr(val));
                             continue;
                         }
                     } else if val != cd.expected[i] {
@@ -151,7 +172,7 @@ impl<'a> CASNDescriptor<'a> {
         for i in 0..cd.addrs.len() {
             #[allow(unused)]
             (*cd.addrs[i]).compare_exchange_weak(
-                (cd_ptr as usize) | CASN_DESCRIPTOR_MASK,
+                Self::to_usize(cd_ptr),
                 if succeeded { cd.new[i] } else { cd.expected[i] },
                 Ordering::SeqCst,
                 Ordering::SeqCst,
@@ -165,7 +186,8 @@ pub(crate) fn casn(addrs: &[&AtomicUsize], expected: &[usize], new: &[usize]) ->
     assert_eq!(addrs.len(), expected.len());
     assert_eq!(addrs.len(), new.len());
     let casn_descriptor = CASNDescriptor::new(addrs, expected, new);
-    unsafe { CASNDescriptor::cas(&casn_descriptor as *const CASNDescriptor) }
+    // SAFETY: invoking on a valid pointer
+    unsafe { CASNDescriptor::cas(&casn_descriptor as *const CASNDescriptor<'_>) }
 }
 
 pub(crate) fn read(addr: &AtomicUsize) -> usize {
@@ -174,8 +196,9 @@ pub(crate) fn read(addr: &AtomicUsize) -> usize {
     loop {
         r = RDCSSDescriptor::read(addr);
         if CASNDescriptor::is_descriptor(r) {
+            // SAFETY: r is a valid casn desciptor stored previously
             unsafe {
-                CASNDescriptor::cas((r & PTR_MASK) as *const CASNDescriptor<'_>);
+                CASNDescriptor::cas(CASNDescriptor::to_ptr(r));
             }
         } else {
             return r;
