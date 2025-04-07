@@ -82,7 +82,7 @@ impl RDCSSDescriptor {
         loop {
             r = addr.load(Ordering::SeqCst);
             if Self::is_desciptor(r) {
-                // SAFETY: r is discriptor pointer stored previously
+                // SAFETY: r is a valid discriptor pointer stored previously
                 unsafe {
                     Self::complete(Self::to_ptr(r));
                 }
