@@ -64,6 +64,20 @@ impl RDCSSDescriptor {
             Ordering::SeqCst,
         );
     }
+
+    fn read(addr: &AtomicUsize) -> usize {
+        let mut r: usize;
+        loop {
+            r = addr.load(Ordering::SeqCst);
+            if Self::is_desciptor(r) {
+                unsafe {
+                    Self::complete((r & PTR_MASK) as *const RDCSSDescriptor);
+                }
+            } else {
+                return r;
+            }
+        }
+    }
 }
 
 #[derive(PartialEq)]
@@ -81,14 +95,7 @@ pub(crate) struct CASNDescriptor<'a> {
 }
 
 impl<'a> CASNDescriptor<'a> {
-    pub(crate) fn new(
-        addrs: &'a [&'a AtomicUsize],
-        expected: &'a [usize],
-        new: &'a [usize],
-    ) -> Self {
-        assert_eq!(addrs.len(), expected.len());
-        assert_eq!(addrs.len(), new.len());
-
+    fn new(addrs: &'a [&'a AtomicUsize], expected: &'a [usize], new: &'a [usize]) -> Self {
         CASNDescriptor {
             addrs,
             expected,
@@ -101,33 +108,30 @@ impl<'a> CASNDescriptor<'a> {
         value & CASN_DESCRIPTOR_MASK == CASN_DESCRIPTOR_MASK
     }
 
-    fn as_usize(&self) -> usize {
-        self as *const CASNDescriptor<'_> as usize
-    }
-
-    pub(crate) unsafe fn cas(&self) -> bool {
-        if self.status.load(Ordering::SeqCst) == Status::Undecided as usize {
+    unsafe fn cas(cd_ptr: *const CASNDescriptor) -> bool {
+        let cd = cd_ptr.as_ref().unwrap();
+        if cd.status.load(Ordering::SeqCst) == Status::Undecided as usize {
             let mut status = Status::Succeeded;
-            for i in 0..self.addrs.len() {
+            for i in 0..cd.addrs.len() {
                 if status != Status::Succeeded {
                     break;
                 }
                 loop {
                     let rdcss = RDCSSDescriptor::new(
-                        &self.status as *const AtomicUsize,
+                        &cd.status as *const AtomicUsize,
                         Status::Undecided as usize,
-                        self.addrs[i],
-                        self.expected[i],
-                        self.as_usize() | CASN_DESCRIPTOR_MASK,
+                        cd.addrs[i],
+                        cd.expected[i],
+                        (cd_ptr as usize) | CASN_DESCRIPTOR_MASK,
                     );
 
                     let val = RDCSSDescriptor::cas(&rdcss as *const RDCSSDescriptor);
                     if Self::is_descriptor(val) {
-                        if val & PTR_MASK != self.as_usize() {
+                        if val & PTR_MASK != (cd_ptr as usize) {
                             Self::cas((val as *const CASNDescriptor<'_>).as_ref().unwrap());
                             continue;
                         }
-                    } else if val != self.expected[i] {
+                    } else if val != cd.expected[i] {
                         status = Status::Failed;
                     }
                     break;
@@ -135,7 +139,7 @@ impl<'a> CASNDescriptor<'a> {
             }
 
             #[allow(unused)]
-            self.status.compare_exchange_weak(
+            cd.status.compare_exchange_weak(
                 Status::Undecided as usize,
                 status as usize,
                 Ordering::SeqCst,
@@ -143,21 +147,39 @@ impl<'a> CASNDescriptor<'a> {
             );
         }
 
-        let succeeded = self.status.load(Ordering::SeqCst) == (Status::Succeeded as usize);
-        for i in 0..self.addrs.len() {
+        let succeeded = cd.status.load(Ordering::SeqCst) == (Status::Succeeded as usize);
+        for i in 0..cd.addrs.len() {
             #[allow(unused)]
-            (*self.addrs[i]).compare_exchange_weak(
-                self.as_usize() | CASN_DESCRIPTOR_MASK,
-                if succeeded {
-                    self.new[i]
-                } else {
-                    self.expected[i]
-                },
+            (*cd.addrs[i]).compare_exchange_weak(
+                (cd_ptr as usize) | CASN_DESCRIPTOR_MASK,
+                if succeeded { cd.new[i] } else { cd.expected[i] },
                 Ordering::SeqCst,
                 Ordering::SeqCst,
             );
         }
         succeeded
+    }
+}
+
+pub(crate) fn casn(addrs: &[&AtomicUsize], expected: &[usize], new: &[usize]) -> bool {
+    assert_eq!(addrs.len(), expected.len());
+    assert_eq!(addrs.len(), new.len());
+    let casn_descriptor = CASNDescriptor::new(addrs, expected, new);
+    unsafe { CASNDescriptor::cas(&casn_descriptor as *const CASNDescriptor) }
+}
+
+pub(crate) fn read(addr: &AtomicUsize) -> usize {
+    let mut r: usize;
+
+    loop {
+        r = RDCSSDescriptor::read(addr);
+        if CASNDescriptor::is_descriptor(r) {
+            unsafe {
+                CASNDescriptor::cas((r & PTR_MASK) as *const CASNDescriptor<'_>);
+            }
+        } else {
+            return r;
+        }
     }
 }
 
@@ -173,11 +195,12 @@ mod tests {
         let b = AtomicUsize::new(1488);
         let memory = &[&a, &b];
 
-        let casn = CASNDescriptor::new(memory, &[69, 1488], &[1488, 69]);
-        unsafe {
-            casn.cas();
-        }
-        assert_eq!(a.load(Ordering::SeqCst), 1488);
-        assert_eq!(b.load(Ordering::SeqCst), 69);
+        assert_eq!(read(&a), 69);
+        assert_eq!(read(&b), 1488);
+
+        casn(memory, &[69, 1488], &[1488, 69]);
+
+        assert_eq!(read(&a), 1488);
+        assert_eq!(read(&b), 69);
     }
 }
