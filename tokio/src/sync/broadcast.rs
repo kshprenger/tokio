@@ -123,11 +123,12 @@ use crate::task::coop::cooperative;
 use crate::util::linked_list::{self, GuardedLinkedList, LinkedList};
 use crate::util::WakeList;
 
+use mwcas::*;
 use std::fmt;
 use std::future::Future;
 use std::marker::PhantomPinned;
 use std::pin::Pin;
-use std::ptr::NonNull;
+use std::ptr::{null, null_mut, NonNull};
 use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release, SeqCst};
 use std::task::{ready, Context, Poll, Waker};
 
@@ -335,43 +336,36 @@ pub mod error {
 
 use self::error::{RecvError, SendError, TryRecvError};
 
-use super::casn::CASNDescriptor;
 use super::Notify;
 
 /// Data shared between senders and receivers.
 struct Shared<T> {
     /// slots in the channel.
-    buffer: Box<[RwLock<Slot<T>>]>,
+    buffer: Box<[Slot<T>]>,
 
     /// Mask a position -> index.
     mask: usize,
 
     /// Tail of the queue. Includes the rx wait list.
-    tail: Mutex<Tail>,
+    pos: U64Pointer,
+
+    /// Number of active receivers.
+    rx_cnt: U64Pointer,
+
+    /// True if the channel is closed.
+    closed: U64Pointer,
+
+    /// Receivers waiting for a value.
+    waiters: U64Pointer,
 
     /// Number of outstanding Sender handles.
-    num_tx: AtomicUsize,
+    num_tx: U64Pointer,
 
     /// Number of outstanding weak Sender handles.
-    num_weak_tx: AtomicUsize,
+    num_weak_tx: U64Pointer,
 
     /// Notify when the last subscribed [`Receiver`] drops.
     notify_last_rx_drop: Notify,
-}
-
-/// Next position to write a value.
-struct Tail {
-    /// Next position to write to.
-    pos: u64,
-
-    /// Number of active receivers.
-    rx_cnt: usize,
-
-    /// True if the channel is closed.
-    closed: bool,
-
-    /// Receivers waiting for a value.
-    waiters: LinkedList<Waiter, <Waiter as linked_list::Link>::Target>,
 }
 
 /// Slot in the buffer.
@@ -382,16 +376,16 @@ struct Slot<T> {
     ///
     /// An atomic is used as it is mutated concurrently with the slot read lock
     /// acquired.
-    rem: AtomicUsize,
+    rem: U64Pointer,
 
     /// Uniquely identifies the `send` stored in the slot.
-    pos: u64,
+    pos: U64Pointer,
 
     /// The value being broadcast.
     ///
     /// The value is set by `send` when the write lock is held. When a reader
     /// drops, `rem` is decremented. When it hits zero, the value is dropped.
-    val: UnsafeCell<Option<T>>,
+    val: HeapPointer<Option<T>>,
 }
 
 /// An entry in the wait queue.
@@ -403,7 +397,7 @@ struct Waiter {
     waker: Option<Waker>,
 
     /// Intrusive linked-list pointers.
-    pointers: linked_list::Pointers<Waiter>,
+    next: *mut Waiter,
 
     /// Should not be `Unpin`.
     _p: PhantomPinned,
@@ -414,22 +408,10 @@ impl Waiter {
         Self {
             queued: AtomicBool::new(false),
             waker: None,
-            pointers: linked_list::Pointers::new(),
+            next: null_mut::<Waiter>(),
             _p: PhantomPinned,
         }
     }
-}
-
-generate_addr_of_methods! {
-    impl<> Waiter {
-        unsafe fn addr_of_pointers(self: NonNull<Self>) -> NonNull<linked_list::Pointers<Waiter>> {
-            &self.pointers
-        }
-    }
-}
-
-struct RecvGuard<'a, T> {
-    slot: RwLockReadGuard<'a, Slot<T>>,
 }
 
 /// Receive a value future.
@@ -519,7 +501,7 @@ unsafe impl<T: Send> Sync for WeakSender<T> {}
 unsafe impl<T: Send> Send for Receiver<T> {}
 unsafe impl<T: Send> Sync for Receiver<T> {}
 
-impl<T> Sender<T> {
+impl<T: Clone> Sender<T> {
     /// Creates the sending-half of the [`broadcast`] channel.
     ///
     /// See the documentation of [`broadcast::channel`] for more information on this method.
@@ -557,24 +539,22 @@ impl<T> Sender<T> {
         let mut buffer = Vec::with_capacity(capacity);
 
         for i in 0..capacity {
-            buffer.push(RwLock::new(Slot {
-                rem: AtomicUsize::new(0),
-                pos: (i as u64).wrapping_sub(capacity as u64),
-                val: UnsafeCell::new(None),
-            }));
+            buffer.push(Slot {
+                rem: U64Pointer::new(0),
+                pos: U64Pointer::new((i as u64).wrapping_sub(capacity as u64)),
+                val: HeapPointer::new(None),
+            });
         }
 
         let shared = Arc::new(Shared {
             buffer: buffer.into_boxed_slice(),
             mask: capacity - 1,
-            tail: Mutex::new(Tail {
-                pos: 0,
-                rx_cnt: receiver_count,
-                closed: false,
-                waiters: LinkedList::new(),
-            }),
-            num_tx: AtomicUsize::new(1),
-            num_weak_tx: AtomicUsize::new(0),
+            pos: U64Pointer::new(0),
+            rx_cnt: U64Pointer::new(receiver_count as u64),
+            closed: U64Pointer::new(false as u64),
+            waiters: U64Pointer::new(null_mut::<Waiter>() as u64),
+            num_tx: U64Pointer::new(1),
+            num_weak_tx: U64Pointer::new(0),
             notify_last_rx_drop: Notify::new(),
         });
 
@@ -633,41 +613,38 @@ impl<T> Sender<T> {
     /// }
     /// ```
     pub fn send(&self, value: T) -> Result<usize, SendError<T>> {
-        let mut tail = self.shared.tail.lock();
+        let shared = &self.shared;
+        let guard = crossbeam_epoch::pin();
+        loop {
+            if shared.rx_cnt.read(&guard) == 0 {
+                return Err(SendError(value));
+            }
 
-        if tail.rx_cnt == 0 {
-            return Err(SendError(value));
+            let pos = shared.pos.read(&guard);
+            let rem = shared.rx_cnt.read(&guard);
+            let idx = (pos & self.shared.mask as u64) as usize;
+
+            let slot = &shared.buffer[idx];
+            let slot_pos = slot.pos.read(&guard);
+            let slot_rem = slot.rem.read(&guard);
+            let slot_val = slot.val.read(&guard);
+            let new_val = value.clone();
+
+            let waiters = shared.waiters.read(&guard);
+
+            let mut mwcas = MwCas::new();
+
+            mwcas.compare_exchange_u64(&shared.pos, pos, pos.wrapping_add(1));
+            mwcas.compare_exchange_u64(&slot.pos, slot_pos, pos);
+            mwcas.compare_exchange_u64(&slot.rem, slot_rem, rem);
+            mwcas.compare_exchange(&slot.val, slot_val, Some(new_val));
+            mwcas.compare_exchange_u64(&shared.waiters, waiters, null_mut::<Waiter>() as u64);
+
+            if mwcas.exec(&guard) {
+                shared.notify_rx(waiters as *mut Waiter);
+                return Ok(rem as usize);
+            }
         }
-
-        // Position to write into
-        let pos = tail.pos;
-        let rem = tail.rx_cnt;
-        let idx = (pos & self.shared.mask as u64) as usize;
-
-        // Update the tail position
-        tail.pos = tail.pos.wrapping_add(1);
-
-        // Get the slot
-        let mut slot = self.shared.buffer[idx].write();
-
-        // Track the position
-        slot.pos = pos;
-
-        // Set remaining receivers
-        slot.rem.with_mut(|v| *v = rem);
-
-        // Write the value
-        slot.val = UnsafeCell::new(Some(value));
-
-        // Release the slot lock before notifying the receivers.
-        drop(slot);
-
-        // Notify and release the mutex. This must happen after the slot lock is
-        // released, otherwise the writer lock bit could be cleared while another
-        // thread is in the critical section.
-        self.shared.notify_rx(tail);
-
-        Ok(rem)
     }
 
     /// Creates a new [`Receiver`] handle that will receive values sent **after**
@@ -704,9 +681,16 @@ impl<T> Sender<T> {
     /// the channel is closed.
     #[must_use = "Downgrade creates a WeakSender without destroying the original non-weak sender."]
     pub fn downgrade(&self) -> WeakSender<T> {
-        self.shared.num_weak_tx.fetch_add(1, Relaxed);
-        WeakSender {
-            shared: self.shared.clone(),
+        let guard = crossbeam_epoch::pin();
+        loop {
+            let old = self.shared.num_weak_tx.read(&guard);
+            let mut mwcas = MwCas::new();
+            mwcas.compare_exchange_u64(&self.shared.num_weak_tx, old, old + 1);
+            if mwcas.exec(&guard) {
+                return WeakSender {
+                    shared: self.shared.clone(),
+                };
+            }
         }
     }
 
@@ -747,24 +731,24 @@ impl<T> Sender<T> {
     ///     assert_eq!(tx.len(), 2);
     /// }
     /// ```
-    pub fn len(&self) -> usize {
-        let tail = self.shared.tail.lock();
+    // pub fn len(&self) -> usize {
+    //     let tail = self.shared.tail.lock();
 
-        let base_idx = (tail.pos & self.shared.mask as u64) as usize;
-        let mut low = 0;
-        let mut high = self.shared.buffer.len();
-        while low < high {
-            let mid = low + (high - low) / 2;
-            let idx = base_idx.wrapping_add(mid) & self.shared.mask;
-            if self.shared.buffer[idx].read().rem.load(SeqCst) == 0 {
-                low = mid + 1;
-            } else {
-                high = mid;
-            }
-        }
+    //     let base_idx = (tail.pos & self.shared.mask as u64) as usize;
+    //     let mut low = 0;
+    //     let mut high = self.shared.buffer.len();
+    //     while low < high {
+    //         let mid = low + (high - low) / 2;
+    //         let idx = base_idx.wrapping_add(mid) & self.shared.mask;
+    //         if self.shared.buffer[idx].read().rem.load(SeqCst) == 0 {
+    //             low = mid + 1;
+    //         } else {
+    //             high = mid;
+    //         }
+    //     }
 
-        self.shared.buffer.len() - low
-    }
+    //     self.shared.buffer.len() - low
+    // }
 
     /// Returns true if there are no queued values.
     ///
@@ -794,12 +778,12 @@ impl<T> Sender<T> {
     ///     assert!(tx.is_empty());
     /// }
     /// ```
-    pub fn is_empty(&self) -> bool {
-        let tail = self.shared.tail.lock();
+    // pub fn is_empty(&self) -> bool {
+    //     let tail = self.shared.tail.lock();
 
-        let idx = (tail.pos.wrapping_sub(1) & self.shared.mask as u64) as usize;
-        self.shared.buffer[idx].read().rem.load(SeqCst) == 0
-    }
+    //     let idx = (tail.pos.wrapping_sub(1) & self.shared.mask as u64) as usize;
+    //     self.shared.buffer[idx].read().rem.load(SeqCst) == 0
+    // }
 
     /// Returns the number of active receivers.
     ///
@@ -838,8 +822,8 @@ impl<T> Sender<T> {
     /// }
     /// ```
     pub fn receiver_count(&self) -> usize {
-        let tail = self.shared.tail.lock();
-        tail.rx_cnt
+        let guard = crossbeam_epoch::pin();
+        self.shared.rx_cnt.read(&guard) as usize
     }
 
     /// Returns `true` if senders belong to the same channel.
@@ -896,8 +880,8 @@ impl<T> Sender<T> {
 
             {
                 // Ensure the lock drops if the channel isn't closed
-                let tail = self.shared.tail.lock();
-                if tail.closed {
+                let guard = crossbeam_epoch::pin();
+                if self.shared.closed.read(&guard) == true as u64 {
                     return;
                 }
             }
@@ -907,139 +891,93 @@ impl<T> Sender<T> {
     }
 
     fn close_channel(&self) {
-        let mut tail = self.shared.tail.lock();
-        tail.closed = true;
+        let guard = crossbeam_epoch::pin();
+        loop {
+            let waiters = self.shared.waiters.read(&guard);
 
-        self.shared.notify_rx(tail);
+            let mut mwcas = MwCas::new();
+            mwcas.compare_exchange_u64(&self.shared.waiters, waiters, null::<Waiter>() as u64);
+            mwcas.compare_exchange_u64(&self.shared.closed, false as u64, true as u64);
+            if mwcas.exec(&guard) {
+                self.shared.notify_rx(waiters as *mut Waiter);
+                return;
+            }
+        }
     }
 
     /// Returns the number of [`Sender`] handles.
     pub fn strong_count(&self) -> usize {
-        self.shared.num_tx.load(Acquire)
+        let guard = crossbeam_epoch::pin();
+        self.shared.num_tx.read(&guard) as usize
     }
 
     /// Returns the number of [`WeakSender`] handles.
     pub fn weak_count(&self) -> usize {
-        self.shared.num_weak_tx.load(Acquire)
+        let guard = crossbeam_epoch::pin();
+        self.shared.num_weak_tx.read(&guard) as usize
     }
 }
 
 /// Create a new `Receiver` which reads starting from the tail.
 fn new_receiver<T>(shared: Arc<Shared<T>>) -> Receiver<T> {
-    let mut tail = shared.tail.lock();
+    let guard = crossbeam_epoch::pin();
 
-    assert!(tail.rx_cnt != MAX_RECEIVERS, "max receivers");
+    assert!(
+        shared.rx_cnt.read(&guard) as usize != MAX_RECEIVERS,
+        "max receivers"
+    );
 
-    if tail.rx_cnt == 0 {
-        // Potentially need to re-open the channel, if a new receiver has been added between calls
-        // to poll(). Note that we use rx_cnt == 0 instead of is_closed since is_closed also
-        // applies if the sender has been dropped
-        tail.closed = false;
-    }
-
-    tail.rx_cnt = tail.rx_cnt.checked_add(1).expect("overflow");
-    let next = tail.pos;
-
-    drop(tail);
-
-    Receiver { shared, next }
-}
-
-/// List used in `Shared::notify_rx`. It wraps a guarded linked list
-/// and gates the access to it on the `Shared.tail` mutex. It also empties
-/// the list on drop.
-struct WaitersList<'a, T> {
-    list: GuardedLinkedList<Waiter, <Waiter as linked_list::Link>::Target>,
-    is_empty: bool,
-    shared: &'a Shared<T>,
-}
-
-impl<'a, T> Drop for WaitersList<'a, T> {
-    fn drop(&mut self) {
-        // If the list is not empty, we unlink all waiters from it.
-        // We do not wake the waiters to avoid double panics.
-        if !self.is_empty {
-            let _lock_guard = self.shared.tail.lock();
-            while self.list.pop_back().is_some() {}
+    loop {
+        let prev_closed = shared.closed.read(&guard);
+        let mut new_closed = prev_closed;
+        let rx_cnt = shared.rx_cnt.read(&guard);
+        if rx_cnt == 0 {
+            // Potentially need to re-open the channel, if a new receiver has been added between calls
+            // to poll(). Note that we use rx_cnt == 0 instead of is_closed since is_closed also
+            // applies if the sender has been dropped
+            new_closed = false as u64;
         }
-    }
-}
 
-impl<'a, T> WaitersList<'a, T> {
-    fn new(
-        unguarded_list: LinkedList<Waiter, <Waiter as linked_list::Link>::Target>,
-        guard: Pin<&'a Waiter>,
-        shared: &'a Shared<T>,
-    ) -> Self {
-        let guard_ptr = NonNull::from(guard.get_ref());
-        let list = unguarded_list.into_guarded(guard_ptr);
-        WaitersList {
-            list,
-            is_empty: false,
-            shared,
-        }
-    }
+        let next = shared.pos.read(&guard);
 
-    /// Removes the last element from the guarded list. Modifying this list
-    /// requires an exclusive access to the main list in `Notify`.
-    fn pop_back_locked(&mut self, _tail: &mut Tail) -> Option<NonNull<Waiter>> {
-        let result = self.list.pop_back();
-        if result.is_none() {
-            // Save information about emptiness to avoid waiting for lock
-            // in the destructor.
-            self.is_empty = true;
+        let mut mwcas = MwCas::new();
+        mwcas.compare_exchange_u64(
+            &shared.rx_cnt,
+            rx_cnt,
+            rx_cnt.checked_add(1).expect("overflow"),
+        );
+        mwcas.compare_exchange_u64(&shared.closed, prev_closed, new_closed);
+        if mwcas.exec(&guard) {
+            return Receiver { shared, next };
         }
-        result
     }
 }
 
 impl<T> Shared<T> {
-    fn notify_rx<'a, 'b: 'a>(&'b self, mut tail: MutexGuard<'a, Tail>) {
-        // It is critical for `GuardedLinkedList` safety that the guard node is
-        // pinned in memory and is not dropped until the guarded list is dropped.
-        let guard = Waiter::new();
-        pin!(guard);
-
-        // We move all waiters to a secondary list. It uses a `GuardedLinkedList`
-        // underneath to allow every waiter to safely remove itself from it.
-        //
-        // * This list will be still guarded by the `waiters` lock.
-        //   `NotifyWaitersList` wrapper makes sure we hold the lock to modify it.
-        // * This wrapper will empty the list on drop. It is critical for safety
-        //   that we will not leave any list entry with a pointer to the local
-        //   guard node after this function returns / panics.
-        let mut list = WaitersList::new(std::mem::take(&mut tail.waiters), guard.as_ref(), self);
-
+    fn notify_rx(&self, mut waiters: *mut Waiter) {
         let mut wakers = WakeList::new();
         'outer: loop {
             while wakers.can_push() {
-                match list.pop_back_locked(&mut tail) {
-                    Some(waiter) => {
-                        unsafe {
-                            // Safety: accessing `waker` is safe because
-                            // the tail lock is held.
-                            if let Some(waker) = (*waiter.as_ptr()).waker.take() {
-                                wakers.push(waker);
-                            }
-
-                            // Safety: `queued` is atomic.
-                            let queued = &(*waiter.as_ptr()).queued;
-                            // `Relaxed` suffices because the tail lock is held.
-                            assert!(queued.load(Relaxed));
-                            // `Release` is needed to synchronize with `Recv::drop`.
-                            // It is critical to set this variable **after** waker
-                            // is extracted, otherwise we may data race with `Recv::drop`.
-                            queued.store(false, Release);
+                if waiters.is_null() {
+                    break 'outer;
+                } else {
+                    unsafe {
+                        if let Some(waker) = (*waiters).waker.take() {
+                            wakers.push(waker);
                         }
-                    }
-                    None => {
-                        break 'outer;
+
+                        // Safety: `queued` is atomic.
+                        let queued = &(*waiters).queued;
+                        // `Relaxed` suffices because the tail lock is held.
+                        assert!(queued.load(Relaxed));
+                        // `Release` is needed to synchronize with `Recv::drop`.
+                        // It is critical to set this variable **after** waker
+                        // is extracted, otherwise we may data race with `Recv::drop`.
+                        queued.store(false, Release);
+                        waiters = (*waiters).next
                     }
                 }
             }
-
-            // Release the lock before waking.
-            drop(tail);
 
             // Before we acquire the lock again all sorts of things can happen:
             // some waiters may remove themselves from the list and new waiters
@@ -1047,13 +985,7 @@ impl<T> Shared<T> {
             // wake up waiters which will then queue themselves again.
 
             wakers.wake_all();
-
-            // Acquire the lock again.
-            tail = self.tail.lock();
         }
-
-        // Release the lock before waking.
-        drop(tail);
 
         wakers.wake_all();
     }
@@ -1062,16 +994,36 @@ impl<T> Shared<T> {
 impl<T> Clone for Sender<T> {
     fn clone(&self) -> Sender<T> {
         let shared = self.shared.clone();
-        shared.num_tx.fetch_add(1, Relaxed);
+        let guard = crossbeam_epoch::pin();
+
+        loop {
+            let num_tx = shared.num_tx.read(&guard);
+
+            let mut cas = MwCas::new();
+
+            cas.compare_exchange_u64(&shared.num_tx, num_tx, num_tx + 1);
+            if cas.exec(&guard) {
+                break;
+            }
+        }
 
         Sender { shared }
     }
 }
 
-impl<T> Drop for Sender<T> {
+impl<T: Clone> Drop for Sender<T> {
     fn drop(&mut self) {
-        if 1 == self.shared.num_tx.fetch_sub(1, AcqRel) {
-            self.close_channel();
+        let guard = crossbeam_epoch::pin();
+        loop {
+            let num_tx = self.shared.num_tx.read(&guard);
+            if num_tx == 1 {
+                let mut cas = MwCas::new();
+                cas.compare_exchange_u64(&self.shared.num_tx, num_tx, num_tx - 1);
+                if cas.exec(&guard) {
+                    self.close_channel();
+                    return;
+                }
+            }
         }
     }
 }
@@ -1083,56 +1035,69 @@ impl<T> WeakSender<T> {
     /// the channel wasn't previously dropped, otherwise `None` is returned.
     #[must_use]
     pub fn upgrade(&self) -> Option<Sender<T>> {
-        let mut tx_count = self.shared.num_tx.load(Acquire);
+        let guard = crossbeam_epoch::pin();
 
         loop {
+            let tx_count = self.shared.num_tx.read(&guard);
             if tx_count == 0 {
                 // channel is closed so this WeakSender can not be upgraded
                 return None;
             }
 
-            match self
-                .shared
-                .num_tx
-                .compare_exchange_weak(tx_count, tx_count + 1, Relaxed, Acquire)
-            {
-                Ok(_) => {
-                    return Some(Sender {
-                        shared: self.shared.clone(),
-                    })
-                }
-                Err(prev_count) => tx_count = prev_count,
+            let mut cas = MwCas::new();
+
+            cas.compare_exchange_u64(&self.shared.num_tx, tx_count, tx_count + 1);
+            if cas.exec(&guard) {
+                return Some(Sender {
+                    shared: self.shared.clone(),
+                });
             }
         }
     }
 
     /// Returns the number of [`Sender`] handles.
     pub fn strong_count(&self) -> usize {
-        self.shared.num_tx.load(Acquire)
+        let guard = crossbeam_epoch::pin();
+        self.shared.num_tx.read(&guard) as usize
     }
 
     /// Returns the number of [`WeakSender`] handles.
     pub fn weak_count(&self) -> usize {
-        self.shared.num_weak_tx.load(Acquire)
+        let guard = crossbeam_epoch::pin();
+        self.shared.num_weak_tx.read(&guard) as usize
     }
 }
 
 impl<T> Clone for WeakSender<T> {
     fn clone(&self) -> WeakSender<T> {
         let shared = self.shared.clone();
-        shared.num_weak_tx.fetch_add(1, Relaxed);
-
-        Self { shared }
+        let guard = crossbeam_epoch::pin();
+        loop {
+            let num_weak_tx = shared.num_weak_tx.read(&guard);
+            let mut cas = MwCas::new();
+            cas.compare_exchange_u64(&shared.num_weak_tx, num_weak_tx, num_weak_tx + 1);
+            if cas.exec(&guard) {
+                return Self { shared };
+            }
+        }
     }
 }
 
 impl<T> Drop for WeakSender<T> {
     fn drop(&mut self) {
-        self.shared.num_weak_tx.fetch_sub(1, AcqRel);
+        let guard = crossbeam_epoch::pin();
+        loop {
+            let num_weak_tx = self.shared.num_weak_tx.read(&guard);
+            let mut cas = MwCas::new();
+            cas.compare_exchange_u64(&self.shared.num_weak_tx, num_weak_tx, num_weak_tx - 1);
+            if cas.exec(&guard) {
+                return;
+            }
+        }
     }
 }
 
-impl<T> Receiver<T> {
+impl<T: Clone> Receiver<T> {
     /// Returns the number of messages that were sent into the channel and that
     /// this [`Receiver`] has yet to receive.
     ///
@@ -1167,7 +1132,8 @@ impl<T> Receiver<T> {
     /// }
     /// ```
     pub fn len(&self) -> usize {
-        let next_send_pos = self.shared.tail.lock().pos;
+        let guard = crossbeam_epoch::pin();
+        let next_send_pos = self.shared.pos.read(&guard);
         (next_send_pos - self.next) as usize
     }
 
@@ -1227,40 +1193,23 @@ impl<T> Receiver<T> {
     fn recv_ref(
         &mut self,
         waiter: Option<(&UnsafeCell<Waiter>, &Waker)>,
-    ) -> Result<RecvGuard<'_, T>, TryRecvError> {
+    ) -> Result<Option<T>, TryRecvError> {
+        let guard = crossbeam_epoch::pin();
         let idx = (self.next & self.shared.mask as u64) as usize;
+        let slot = &self.shared.buffer[idx];
 
-        // The slot holding the next value to read
-        let mut slot = self.shared.buffer[idx].read();
+        loop {
+            let slot_pos = slot.pos.read(&guard);
+            if slot_pos != self.next {
+                let mut old_waker = None;
 
-        if slot.pos != self.next {
-            // Release the `slot` lock before attempting to acquire the `tail`
-            // lock. This is required because `send2` acquires the tail lock
-            // first followed by the slot lock. Acquiring the locks in reverse
-            // order here would result in a potential deadlock: `recv_ref`
-            // acquires the `slot` lock and attempts to acquire the `tail` lock
-            // while `send2` acquired the `tail` lock and attempts to acquire
-            // the slot lock.
-            drop(slot);
-
-            let mut old_waker = None;
-
-            let mut tail = self.shared.tail.lock();
-
-            // Acquire slot lock again
-            slot = self.shared.buffer[idx].read();
-
-            // Make sure the position did not change. This could happen in the
-            // unlikely event that the buffer is wrapped between dropping the
-            // read lock and acquiring the tail lock.
-            if slot.pos != self.next {
-                let next_pos = slot.pos.wrapping_add(self.shared.buffer.len() as u64);
+                let next_pos = slot_pos.wrapping_add(self.shared.buffer.len() as u64);
 
                 if next_pos == self.next {
                     // At this point the channel is empty for *this* receiver. If
                     // it's been closed, then that's what we return, otherwise we
                     // set a waker and return empty.
-                    if tail.closed {
+                    if self.shared.closed.read(&guard) == true as u64 {
                         return Err(TryRecvError::Closed);
                     }
 
@@ -1284,25 +1233,25 @@ impl<T> Receiver<T> {
                                     }
                                 }
 
-                                // If the waiter is not already queued, enqueue it.
-                                // `Relaxed` order suffices: we have synchronized with
-                                // all writers through the tail lock that we hold.
-                                if !(*ptr).queued.load(Relaxed) {
-                                    // `Relaxed` order suffices: all the readers will
-                                    // synchronize with this write through the tail lock.
-                                    (*ptr).queued.store(true, Relaxed);
-                                    tail.waiters.push_front(NonNull::new_unchecked(&mut *ptr));
-                                }
+                                let waiters = self.shared.waiters.read(&guard) as *mut Waiter;
+
+                                (*ptr).next = waiters;
                             });
+
+                            let mut cas = MwCas::new();
+                            let waiter_ptr = waiter.get();
+                            cas.compare_exchange_u64(
+                                &self.shared.waiters,
+                                (*waiter_ptr).next as u64,
+                                waiter_ptr as u64,
+                            );
+                            if cas.exec(&guard) {
+                                drop(old_waker);
+                                return Err(TryRecvError::Empty);
+                            }
+                            continue;
                         }
                     }
-
-                    // Drop the old waker after releasing the locks.
-                    drop(slot);
-                    drop(tail);
-                    drop(old_waker);
-
-                    return Err(TryRecvError::Empty);
                 }
 
                 // At this point, the receiver has lagged behind the sender by
@@ -1310,38 +1259,42 @@ impl<T> Receiver<T> {
                 // catch up by skipping dropped messages and setting the
                 // internal cursor to the **oldest** message stored by the
                 // channel.
-                let next = tail.pos.wrapping_sub(self.shared.buffer.len() as u64);
+                let next = self
+                    .shared
+                    .pos
+                    .read(&guard)
+                    .wrapping_sub(self.shared.buffer.len() as u64);
 
                 let missed = next.wrapping_sub(self.next);
-
-                drop(tail);
 
                 // The receiver is slow but no values have been missed
                 if missed == 0 {
                     self.next = self.next.wrapping_add(1);
-
-                    return Ok(RecvGuard { slot });
+                    return Ok((*slot.val.read(&guard)).clone());
                 }
 
                 self.next = next;
 
                 return Err(TryRecvError::Lagged(missed));
             }
+
+            self.next = self.next.wrapping_add(1);
+            break;
         }
 
-        self.next = self.next.wrapping_add(1);
-
-        Ok(RecvGuard { slot })
+        Ok((*slot.val.read(&guard)).clone())
     }
 
     /// Returns the number of [`Sender`] handles.
     pub fn sender_strong_count(&self) -> usize {
-        self.shared.num_tx.load(Acquire)
+        let guard = crossbeam_epoch::pin();
+        self.shared.num_tx.read(&guard) as usize
     }
 
     /// Returns the number of [`WeakSender`] handles.
     pub fn sender_weak_count(&self) -> usize {
-        self.shared.num_weak_tx.load(Acquire)
+        let guard = crossbeam_epoch::pin();
+        self.shared.num_weak_tx.read(&guard) as usize
     }
 
     /// Checks if a channel is closed.
@@ -1367,7 +1320,8 @@ impl<T> Receiver<T> {
     /// ```
     pub fn is_closed(&self) -> bool {
         // Channel is closed when there are no strong senders left active
-        self.shared.num_tx.load(Acquire) == 0
+        let guard = crossbeam_epoch::pin();
+        self.shared.num_tx.read(&guard) == 0
     }
 }
 
@@ -1516,8 +1470,8 @@ impl<T: Clone> Receiver<T> {
     /// }
     /// ```
     pub fn try_recv(&mut self) -> Result<T, TryRecvError> {
-        let guard = self.recv_ref(None)?;
-        guard.clone_value().ok_or(TryRecvError::Closed)
+        let res = self.recv_ref(None)?;
+        res.ok_or(TryRecvError::Closed)
     }
 
     /// Blocking receive to call outside of asynchronous contexts.
@@ -1585,7 +1539,7 @@ impl<'a, T> Recv<'a, T> {
             waiter: UnsafeCell::new(Waiter {
                 queued: AtomicBool::new(false),
                 waker: None,
-                pointers: linked_list::Pointers::new(),
+                next: null_mut::<Waiter>(),
                 _p: PhantomPinned,
             }),
         }
@@ -1615,72 +1569,14 @@ where
 
         let (receiver, waiter) = self.project();
 
-        let guard = match receiver.recv_ref(Some((waiter, cx.waker()))) {
+        let res = match receiver.recv_ref(Some((waiter, cx.waker()))) {
             Ok(value) => value,
             Err(TryRecvError::Empty) => return Poll::Pending,
             Err(TryRecvError::Lagged(n)) => return Poll::Ready(Err(RecvError::Lagged(n))),
             Err(TryRecvError::Closed) => return Poll::Ready(Err(RecvError::Closed)),
         };
 
-        Poll::Ready(guard.clone_value().ok_or(RecvError::Closed))
-    }
-}
-
-impl<'a, T> Drop for Recv<'a, T> {
-    fn drop(&mut self) {
-        // Safety: `waiter.queued` is atomic.
-        // Acquire ordering is required to synchronize with
-        // `Shared::notify_rx` before we drop the object.
-        let queued = self
-            .waiter
-            .with(|ptr| unsafe { (*ptr).queued.load(Acquire) });
-
-        // If the waiter is queued, we need to unlink it from the waiters list.
-        // If not, no further synchronization is required, since the waiter
-        // is not in the list and, as such, is not shared with any other threads.
-        if queued {
-            // Acquire the tail lock. This is required for safety before accessing
-            // the waiter node.
-            let mut tail = self.receiver.shared.tail.lock();
-
-            // Safety: tail lock is held.
-            // `Relaxed` order suffices because we hold the tail lock.
-            let queued = self
-                .waiter
-                .with_mut(|ptr| unsafe { (*ptr).queued.load(Relaxed) });
-
-            if queued {
-                // Remove the node
-                //
-                // safety: tail lock is held and the wait node is verified to be in
-                // the list.
-                unsafe {
-                    self.waiter.with_mut(|ptr| {
-                        tail.waiters.remove((&mut *ptr).into());
-                    });
-                }
-            }
-        }
-    }
-}
-
-/// # Safety
-///
-/// `Waiter` is forced to be !Unpin.
-unsafe impl linked_list::Link for Waiter {
-    type Handle = NonNull<Waiter>;
-    type Target = Waiter;
-
-    fn as_raw(handle: &NonNull<Waiter>) -> NonNull<Waiter> {
-        *handle
-    }
-
-    unsafe fn from_raw(ptr: NonNull<Waiter>) -> NonNull<Waiter> {
-        ptr
-    }
-
-    unsafe fn pointers(target: NonNull<Waiter>) -> NonNull<linked_list::Pointers<Waiter>> {
-        Waiter::addr_of_pointers(target)
+        Poll::Ready(res.ok_or(RecvError::Closed))
     }
 }
 
@@ -1699,25 +1595,6 @@ impl<T> fmt::Debug for WeakSender<T> {
 impl<T> fmt::Debug for Receiver<T> {
     fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(fmt, "broadcast::Receiver")
-    }
-}
-
-impl<'a, T> RecvGuard<'a, T> {
-    fn clone_value(&self) -> Option<T>
-    where
-        T: Clone,
-    {
-        self.slot.val.with(|ptr| unsafe { (*ptr).clone() })
-    }
-}
-
-impl<'a, T> Drop for RecvGuard<'a, T> {
-    fn drop(&mut self) {
-        // Decrement the remaining counter
-        if 1 == self.slot.rem.fetch_sub(1, SeqCst) {
-            // Safety: Last receiver, drop the value
-            self.slot.val.with_mut(|ptr| unsafe { *ptr = None });
-        }
     }
 }
 
