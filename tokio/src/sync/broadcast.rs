@@ -131,6 +131,7 @@ use std::pin::Pin;
 use std::ptr::{null, null_mut, NonNull};
 use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release, SeqCst};
 use std::task::{ready, Context, Poll, Waker};
+use std::time::Duration;
 
 /// Sending-half of the [`broadcast`] channel.
 ///
@@ -163,7 +164,7 @@ use std::task::{ready, Context, Poll, Waker};
 /// ```
 ///
 /// [`broadcast`]: crate::sync::broadcast
-pub struct Sender<T> {
+pub struct Sender<T: Clone> {
     shared: Arc<Shared<T>>,
 }
 
@@ -492,8 +493,8 @@ pub fn channel<T: Clone>(capacity: usize) -> (Sender<T>, Receiver<T>) {
     (tx, rx)
 }
 
-unsafe impl<T: Send> Send for Sender<T> {}
-unsafe impl<T: Send> Sync for Sender<T> {}
+unsafe impl<T: Send + Clone> Send for Sender<T> {}
+unsafe impl<T: Send + Clone> Sync for Sender<T> {}
 
 unsafe impl<T: Send> Send for WeakSender<T> {}
 unsafe impl<T: Send> Sync for WeakSender<T> {}
@@ -541,7 +542,7 @@ impl<T: Clone> Sender<T> {
         for i in 0..capacity {
             buffer.push(Slot {
                 rem: U64Pointer::new(0),
-                pos: U64Pointer::new((i as u64).wrapping_sub(capacity as u64)),
+                pos: U64Pointer::new(0),
                 val: HeapPointer::new(None),
             });
         }
@@ -625,8 +626,8 @@ impl<T: Clone> Sender<T> {
             let idx = (pos & self.shared.mask as u64) as usize;
 
             let slot = &shared.buffer[idx];
-            let slot_pos = slot.pos.read(&guard);
             let slot_rem = slot.rem.read(&guard);
+            let slot_pos = slot.pos.read(&guard);
             let slot_val = slot.val.read(&guard);
             let new_val = value.clone();
 
@@ -991,7 +992,7 @@ impl<T> Shared<T> {
     }
 }
 
-impl<T> Clone for Sender<T> {
+impl<T: Clone> Clone for Sender<T> {
     fn clone(&self) -> Sender<T> {
         let shared = self.shared.clone();
         let guard = crossbeam_epoch::pin();
@@ -1011,24 +1012,24 @@ impl<T> Clone for Sender<T> {
     }
 }
 
-impl<T: Clone> Drop for Sender<T> {
-    fn drop(&mut self) {
-        let guard = crossbeam_epoch::pin();
-        loop {
-            let num_tx = self.shared.num_tx.read(&guard);
-            if num_tx == 1 {
-                let mut cas = MwCas::new();
-                cas.compare_exchange_u64(&self.shared.num_tx, num_tx, num_tx - 1);
-                if cas.exec(&guard) {
-                    self.close_channel();
-                    return;
-                }
-            }
-        }
-    }
-}
+// impl<T: Clone> Drop for Sender<T> {
+//     fn drop(&mut self) {
+//         let guard = crossbeam_epoch::pin();
+//         loop {
+//             let num_tx = self.shared.num_tx.read(&guard);
+//             if num_tx == 1 {
+//                 let mut cas = MwCas::new();
+//                 cas.compare_exchange_u64(&self.shared.num_tx, num_tx, num_tx - 1);
+//                 if cas.exec(&guard) {
+//                     self.close_channel();
+//                     return;
+//                 }
+//             }
+//         }
+//     }
+// }
 
-impl<T> WeakSender<T> {
+impl<T: Clone> WeakSender<T> {
     /// Tries to convert a `WeakSender` into a [`Sender`].
     ///
     /// This will return `Some` if there are other `Sender` instances alive and
@@ -1083,19 +1084,19 @@ impl<T> Clone for WeakSender<T> {
     }
 }
 
-impl<T> Drop for WeakSender<T> {
-    fn drop(&mut self) {
-        let guard = crossbeam_epoch::pin();
-        loop {
-            let num_weak_tx = self.shared.num_weak_tx.read(&guard);
-            let mut cas = MwCas::new();
-            cas.compare_exchange_u64(&self.shared.num_weak_tx, num_weak_tx, num_weak_tx - 1);
-            if cas.exec(&guard) {
-                return;
-            }
-        }
-    }
-}
+// impl<T> Drop for WeakSender<T> {
+//     fn drop(&mut self) {
+//         let guard = crossbeam_epoch::pin();
+//         loop {
+//             let num_weak_tx = self.shared.num_weak_tx.read(&guard);
+//             let mut cas = MwCas::new();
+//             cas.compare_exchange_u64(&self.shared.num_weak_tx, num_weak_tx, num_weak_tx - 1);
+//             if cas.exec(&guard) {
+//                 return;
+//             }
+//         }
+//     }
+// }
 
 impl<T: Clone> Receiver<T> {
     /// Returns the number of messages that were sent into the channel and that
@@ -1503,34 +1504,34 @@ impl<T: Clone> Receiver<T> {
     }
 }
 
-impl<T> Drop for Receiver<T> {
-    fn drop(&mut self) {
-        let mut tail = self.shared.tail.lock();
+// impl<T> Drop for Receiver<T> {
+//     fn drop(&mut self) {
+//         let mut tail = self.shared.tail.lock();
 
-        tail.rx_cnt -= 1;
-        let until = tail.pos;
-        let remaining_rx = tail.rx_cnt;
+//         tail.rx_cnt -= 1;
+//         let until = tail.pos;
+//         let remaining_rx = tail.rx_cnt;
 
-        if remaining_rx == 0 {
-            self.shared.notify_last_rx_drop.notify_waiters();
-            tail.closed = true;
-        }
+//         if remaining_rx == 0 {
+//             self.shared.notify_last_rx_drop.notify_waiters();
+//             tail.closed = true;
+//         }
 
-        drop(tail);
+//         drop(tail);
 
-        while self.next < until {
-            match self.recv_ref(None) {
-                Ok(_) => {}
-                // The channel is closed
-                Err(TryRecvError::Closed) => break,
-                // Ignore lagging, we will catch up
-                Err(TryRecvError::Lagged(..)) => {}
-                // Can't be empty
-                Err(TryRecvError::Empty) => panic!("unexpected empty broadcast channel"),
-            }
-        }
-    }
-}
+//         while self.next < until {
+//             match self.recv_ref(None) {
+//                 Ok(_) => {}
+//                 // The channel is closed
+//                 Err(TryRecvError::Closed) => break,
+//                 // Ignore lagging, we will catch up
+//                 Err(TryRecvError::Lagged(..)) => {}
+//                 // Can't be empty
+//                 Err(TryRecvError::Empty) => panic!("unexpected empty broadcast channel"),
+//             }
+//         }
+//     }
+// }
 
 impl<'a, T> Recv<'a, T> {
     fn new(receiver: &'a mut Receiver<T>) -> Recv<'a, T> {
@@ -1580,7 +1581,7 @@ where
     }
 }
 
-impl<T> fmt::Debug for Sender<T> {
+impl<T: Clone> fmt::Debug for Sender<T> {
     fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(fmt, "broadcast::Sender")
     }

@@ -1,10 +1,9 @@
+use criterion::measurement::WallTime;
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkGroup, Criterion};
 use rand::{Rng, RngCore, SeedableRng};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::{broadcast, Notify};
-
-use criterion::measurement::WallTime;
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkGroup, Criterion};
 
 fn rt() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_multi_thread()
@@ -72,8 +71,8 @@ fn bench_contention(c: &mut Criterion) {
     let mut group = c.benchmark_group("contention");
     contention_impl::<10>(&mut group);
     contention_impl::<100>(&mut group);
-    contention_impl::<500>(&mut group);
     contention_impl::<1000>(&mut group);
+    contention_impl::<10000>(&mut group);
     group.finish();
 }
 
