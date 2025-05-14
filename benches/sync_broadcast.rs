@@ -1,7 +1,7 @@
 use rand::{Rng, RngCore, SeedableRng};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use tokio::sync::{broadcast, Notify};
+use tokio::sync::{broadcast, Barrier, Notify};
 
 use criterion::measurement::WallTime;
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkGroup, Criterion};
@@ -26,54 +26,67 @@ fn do_work(rng: &mut impl RngCore) -> u32 {
         .fold(0, u32::wrapping_add)
 }
 
-fn contention_impl<const N_TASKS: usize>(g: &mut BenchmarkGroup<WallTime>) {
+fn contention_impl<const N_SENDERS: usize, const N_RECIEVERS: usize>(
+    g: &mut BenchmarkGroup<WallTime>,
+) {
     let rt = rt();
 
-    let (tx, _rx) = broadcast::channel::<usize>(1000);
-    let wg = Arc::new((AtomicUsize::new(0), Notify::new()));
+    g.bench_function(
+        format!("{}/{}", N_SENDERS.to_string(), N_RECIEVERS.to_string()),
+        |b| {
+            b.iter(|| {
+                let (tx, _rx) = broadcast::channel::<usize>(100000);
+                let wg = Arc::new(AtomicUsize::new(0));
 
-    for n in 0..N_TASKS {
-        let wg = wg.clone();
-        let mut rx = tx.subscribe();
-        let mut rng = rand::rngs::StdRng::seed_from_u64(n as u64);
-        rt.spawn(async move {
-            while (rx.recv().await).is_ok() {
-                let r = do_work(&mut rng);
-                let _ = black_box(r);
-                if wg.0.fetch_sub(1, Ordering::Relaxed) == 1 {
-                    wg.1.notify_one();
-                }
-            }
-        });
-    }
+                const N_ITERS: usize = 10;
+                let barrier = Arc::new(tokio::sync::Barrier::new(N_SENDERS + N_RECIEVERS + 1));
 
-    const N_ITERS: usize = 100;
-
-    g.bench_function(N_TASKS.to_string(), |b| {
-        b.iter(|| {
-            rt.block_on({
-                let wg = wg.clone();
-                let tx = tx.clone();
-                async move {
-                    for i in 0..N_ITERS {
-                        assert_eq!(wg.0.fetch_add(N_TASKS, Ordering::Relaxed), 0);
-                        tx.send(i).unwrap();
-                        while wg.0.load(Ordering::Relaxed) > 0 {
-                            wg.1.notified().await;
+                for n in 0..N_RECIEVERS {
+                    let wg = wg.clone();
+                    let mut rx = tx.subscribe();
+                    let barrier = barrier.clone();
+                    let mut rng = rand::rngs::StdRng::seed_from_u64(n as u64);
+                    rt.spawn(async move {
+                        barrier.wait().await;
+                        while (rx.recv().await).is_ok() {
+                            let r = do_work(&mut rng);
+                            let _ = black_box(r);
+                            wg.fetch_add(1, Ordering::Relaxed);
                         }
-                    }
+                    });
                 }
+
+                for _ in 0..N_SENDERS {
+                    let tx = tx.clone();
+                    let barrier = barrier.clone();
+                    rt.spawn(async move {
+                        barrier.wait().await;
+                        for i in 0..N_ITERS {
+                            tx.send(i).unwrap();
+                        }
+                    });
+                }
+
+                rt.block_on(async move {
+                    barrier.wait().await;
+                    while wg.load(Ordering::Relaxed) != N_SENDERS * N_ITERS * N_RECIEVERS {
+                        std::hint::spin_loop();
+                    }
+                })
             })
-        })
-    });
+        },
+    );
 }
 
 fn bench_contention(c: &mut Criterion) {
     let mut group = c.benchmark_group("contention");
-    contention_impl::<10>(&mut group);
-    contention_impl::<100>(&mut group);
-    contention_impl::<500>(&mut group);
-    contention_impl::<1000>(&mut group);
+    contention_impl::<1, 1>(&mut group);
+    contention_impl::<4, 1>(&mut group);
+    contention_impl::<32, 1>(&mut group);
+    contention_impl::<1, 4>(&mut group);
+    contention_impl::<1, 32>(&mut group);
+    contention_impl::<4, 4>(&mut group);
+    contention_impl::<32, 32>(&mut group);
     group.finish();
 }
 
