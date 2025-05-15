@@ -35,7 +35,7 @@ fn contention_impl<const N_SENDERS: usize, const N_RECIEVERS: usize>(
         format!("{}/{}", N_SENDERS.to_string(), N_RECIEVERS.to_string()),
         |b| {
             b.iter(|| {
-                let (tx, _rx) = broadcast::channel::<usize>(100000);
+                let (tx, _rx) = broadcast::channel::<usize>(1000);
                 let wg = Arc::new(AtomicUsize::new(0));
 
                 const N_ITERS: usize = 10;
