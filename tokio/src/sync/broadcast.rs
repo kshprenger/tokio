@@ -1200,23 +1200,45 @@ impl<T: Clone> Receiver<T> {
         let slot = &self.shared.buffer[idx];
 
         loop {
-            let slot_pos = slot.pos.read(&guard);
-            if slot_pos != self.next {
+            let closed_old = self.shared.closed.read(&guard);
+            let waiters_old = self.shared.waiters.read(&guard) as *mut Waiter;
+            let slot_pos_old = slot.pos.read(&guard);
+            let slot_val_ref_prev = slot.val.read(&guard);
+
+            let mut mwcas = MwCas::new();
+
+            if slot_pos_old != self.next {
                 let mut old_waker = None;
 
-                let next_pos = slot_pos.wrapping_add(self.shared.buffer.len() as u64);
+                let next_pos = slot_pos_old.wrapping_add(self.shared.buffer.len() as u64);
 
                 if next_pos == self.next {
                     // At this point the channel is empty for *this* receiver. If
-                    // it's been closed, then that's what we return, otherwise we
+                    // it's been closed, then -that's what we return, otherwise we
                     // set a waker and return empty.
-                    if self.shared.closed.read(&guard) == true as u64 {
-                        return Err(TryRecvError::Closed);
+                    if closed_old == true as u64 {
+                        mwcas.compare_exchange_u64(&slot.pos, slot_pos_old, slot_pos_old);
+                        mwcas.compare_exchange(
+                            &slot.val,
+                            slot_val_ref_prev,
+                            (*slot_val_ref_prev).clone(),
+                        );
+                        mwcas.compare_exchange_u64(&self.shared.closed, closed_old, closed_old);
+                        mwcas.compare_exchange_u64(
+                            &self.shared.waiters,
+                            waiters_old as u64,
+                            waiters_old as u64,
+                        );
+
+                        if mwcas.exec(&guard) {
+                            return Err(TryRecvError::Closed);
+                        } else {
+                            continue;
+                        }
                     }
 
                     // Store the waker
                     if let Some((waiter, waker)) = waiter {
-                        // Safety: called while locked.
                         unsafe {
                             // Only queue if not already queued
                             waiter.with_mut(|ptr| {
@@ -1235,22 +1257,30 @@ impl<T: Clone> Receiver<T> {
                                 }
 
                                 let waiters = self.shared.waiters.read(&guard) as *mut Waiter;
-
+                                // Change list head
                                 (*ptr).next = waiters;
                             });
 
-                            let mut cas = MwCas::new();
-                            let waiter_ptr = waiter.get();
-                            cas.compare_exchange_u64(
-                                &self.shared.waiters,
-                                (*waiter_ptr).next as u64,
-                                waiter_ptr as u64,
+                            let waiters_new = waiter.get();
+                            mwcas.compare_exchange_u64(&slot.pos, slot_pos_old, slot_pos_old);
+                            mwcas.compare_exchange(
+                                &slot.val,
+                                slot_val_ref_prev,
+                                (*slot_val_ref_prev).clone(),
                             );
-                            if cas.exec(&guard) {
+                            mwcas.compare_exchange_u64(&self.shared.closed, closed_old, closed_old);
+                            mwcas.compare_exchange_u64(
+                                &self.shared.waiters,
+                                waiters_old as u64,
+                                waiters_new as u64,
+                            );
+
+                            if mwcas.exec(&guard) {
                                 drop(old_waker);
                                 return Err(TryRecvError::Empty);
+                            } else {
+                                continue;
                             }
-                            continue;
                         }
                     }
                 }
@@ -1271,19 +1301,61 @@ impl<T: Clone> Receiver<T> {
                 // The receiver is slow but no values have been missed
                 if missed == 0 {
                     self.next = self.next.wrapping_add(1);
-                    return Ok((*slot.val.read(&guard)).clone());
+                    let res = (*slot_val_ref_prev).clone();
+                    mwcas.compare_exchange_u64(&slot.pos, slot_pos_old, slot_pos_old);
+                    mwcas.compare_exchange(
+                        &slot.val,
+                        slot_val_ref_prev,
+                        (*slot_val_ref_prev).clone(),
+                    );
+                    mwcas.compare_exchange_u64(&self.shared.closed, closed_old, closed_old);
+                    mwcas.compare_exchange_u64(
+                        &self.shared.waiters,
+                        waiters_old as u64,
+                        waiters_old as u64,
+                    );
+                    if mwcas.exec(&guard) {
+                        return Ok(res);
+                    } else {
+                        self.next = self.next.wrapping_sub(1);
+                        continue;
+                    }
                 }
 
                 self.next = next;
 
-                return Err(TryRecvError::Lagged(missed));
+                mwcas.compare_exchange_u64(&slot.pos, slot_pos_old, slot_pos_old);
+                mwcas.compare_exchange(&slot.val, slot_val_ref_prev, (*slot_val_ref_prev).clone());
+                mwcas.compare_exchange_u64(&self.shared.closed, closed_old, closed_old);
+                mwcas.compare_exchange_u64(
+                    &self.shared.waiters,
+                    waiters_old as u64,
+                    waiters_old as u64,
+                );
+                if mwcas.exec(&guard) {
+                    return Err(TryRecvError::Lagged(missed));
+                } else {
+                    continue;
+                }
             }
 
             self.next = self.next.wrapping_add(1);
-            break;
+            mwcas.compare_exchange_u64(&slot.pos, slot_pos_old, slot_pos_old);
+            mwcas.compare_exchange(&slot.val, slot_val_ref_prev, (*slot_val_ref_prev).clone());
+            mwcas.compare_exchange_u64(&self.shared.closed, closed_old, closed_old);
+            mwcas.compare_exchange_u64(
+                &self.shared.waiters,
+                waiters_old as u64,
+                waiters_old as u64,
+            );
+            let res = (*slot_val_ref_prev).clone();
+            if mwcas.exec(&guard) {
+                return Ok(res);
+            } else {
+                self.next = self.next.wrapping_sub(1);
+                continue;
+            }
         }
-
-        Ok((*slot.val.read(&guard)).clone())
     }
 
     /// Returns the number of [`Sender`] handles.
