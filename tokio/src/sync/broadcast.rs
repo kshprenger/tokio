@@ -1217,19 +1217,18 @@ impl<T: Clone> Receiver<T> {
                     // it's been closed, then -that's what we return, otherwise we
                     // set a waker and return empty.
                     if closed_old == true as u64 {
-                        mwcas.compare_exchange_u64(&slot.pos, slot_pos_old, slot_pos_old);
-                        mwcas.compare_exchange(
-                            &slot.val,
-                            slot_val_ref_prev,
-                            (*slot_val_ref_prev).clone(),
-                        );
                         mwcas.compare_exchange_u64(&self.shared.closed, closed_old, closed_old);
                         mwcas.compare_exchange_u64(
                             &self.shared.waiters,
                             waiters_old as u64,
                             waiters_old as u64,
                         );
-
+                        mwcas.compare_exchange_u64(&slot.pos, slot_pos_old, slot_pos_old);
+                        mwcas.compare_exchange(
+                            &slot.val,
+                            slot_val_ref_prev,
+                            (*slot_val_ref_prev).clone(),
+                        );
                         if mwcas.exec(&guard) {
                             return Err(TryRecvError::Closed);
                         } else {
@@ -1262,19 +1261,18 @@ impl<T: Clone> Receiver<T> {
                             });
 
                             let waiters_new = waiter.get();
-                            mwcas.compare_exchange_u64(&slot.pos, slot_pos_old, slot_pos_old);
-                            mwcas.compare_exchange(
-                                &slot.val,
-                                slot_val_ref_prev,
-                                (*slot_val_ref_prev).clone(),
-                            );
                             mwcas.compare_exchange_u64(&self.shared.closed, closed_old, closed_old);
                             mwcas.compare_exchange_u64(
                                 &self.shared.waiters,
                                 waiters_old as u64,
                                 waiters_new as u64,
                             );
-
+                            mwcas.compare_exchange_u64(&slot.pos, slot_pos_old, slot_pos_old);
+                            mwcas.compare_exchange(
+                                &slot.val,
+                                slot_val_ref_prev,
+                                (*slot_val_ref_prev).clone(),
+                            );
                             if mwcas.exec(&guard) {
                                 drop(old_waker);
                                 return Err(TryRecvError::Empty);
@@ -1302,17 +1300,17 @@ impl<T: Clone> Receiver<T> {
                 if missed == 0 {
                     self.next = self.next.wrapping_add(1);
                     let res = (*slot_val_ref_prev).clone();
-                    mwcas.compare_exchange_u64(&slot.pos, slot_pos_old, slot_pos_old);
-                    mwcas.compare_exchange(
-                        &slot.val,
-                        slot_val_ref_prev,
-                        (*slot_val_ref_prev).clone(),
-                    );
                     mwcas.compare_exchange_u64(&self.shared.closed, closed_old, closed_old);
                     mwcas.compare_exchange_u64(
                         &self.shared.waiters,
                         waiters_old as u64,
                         waiters_old as u64,
+                    );
+                    mwcas.compare_exchange_u64(&slot.pos, slot_pos_old, slot_pos_old);
+                    mwcas.compare_exchange(
+                        &slot.val,
+                        slot_val_ref_prev,
+                        (*slot_val_ref_prev).clone(),
                     );
                     if mwcas.exec(&guard) {
                         return Ok(res);
@@ -1324,14 +1322,15 @@ impl<T: Clone> Receiver<T> {
 
                 self.next = next;
 
-                mwcas.compare_exchange_u64(&slot.pos, slot_pos_old, slot_pos_old);
-                mwcas.compare_exchange(&slot.val, slot_val_ref_prev, (*slot_val_ref_prev).clone());
                 mwcas.compare_exchange_u64(&self.shared.closed, closed_old, closed_old);
                 mwcas.compare_exchange_u64(
                     &self.shared.waiters,
                     waiters_old as u64,
                     waiters_old as u64,
                 );
+                mwcas.compare_exchange_u64(&slot.pos, slot_pos_old, slot_pos_old);
+                mwcas.compare_exchange(&slot.val, slot_val_ref_prev, (*slot_val_ref_prev).clone());
+
                 if mwcas.exec(&guard) {
                     return Err(TryRecvError::Lagged(missed));
                 } else {
